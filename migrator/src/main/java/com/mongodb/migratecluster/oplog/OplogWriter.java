@@ -1,265 +1,294 @@
 package com.mongodb.migratecluster.oplog;
 
-import com.mongodb.MongoBulkWriteException;
-import com.mongodb.MongoClient;
-import com.mongodb.bulk.BulkWriteResult;
-import com.mongodb.client.MongoCollection;
-import com.mongodb.client.MongoDatabase;
-import com.mongodb.client.model.*;
-import com.mongodb.migratecluster.AppException;
-import com.mongodb.migratecluster.commandline.ApplicationOptions;
-import com.mongodb.migratecluster.commandline.ResourceFilter;
-import com.mongodb.migratecluster.helpers.MongoDBHelper;
-import com.mongodb.migratecluster.model.Resource;
-import com.mongodb.migratecluster.predicates.CollectionFilterPredicate;
-import com.mongodb.migratecluster.predicates.DatabaseFilterPredicate;
-import com.mongodb.migratecluster.trackers.OplogTimestampTracker;
-import com.mongodb.migratecluster.trackers.WritableDataTracker;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TimeZone;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+import org.bson.BsonTimestamp;
 import org.bson.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
+import com.mongodb.MongoBulkWriteException;
+import com.mongodb.MongoClient;
+import com.mongodb.bulk.BulkWriteError;
+import com.mongodb.bulk.BulkWriteResult;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.model.BulkWriteOptions;
+import com.mongodb.client.model.DeleteOneModel;
+import com.mongodb.client.model.InsertOneModel;
+import com.mongodb.client.model.Sorts;
+import com.mongodb.client.model.UpdateOneModel;
+import com.mongodb.client.model.WriteModel;
+import com.mongodb.migratecluster.commandline.ApplicationOptions;
+import com.mongodb.migratecluster.model.Resource;
+import com.mongodb.migratecluster.predicates.CollectionFilterPredicate;
+import com.mongodb.migratecluster.predicates.DatabaseFilterPredicate;
 
 /**
- * File: OplogWriter
- * Author: Shyam Arjarapu
- * Date: 1/14/19 7:20 AM
- * Description:
+ * File: OplogWriter Author: Shyam Arjarapu Date: 1/14/19 7:20 AM Description:
  *
  * A class to help write the apply the oplog entries on the target
  */
 public class OplogWriter {
-    private final MongoClient oplogStoreClient;
-    private final MongoClient targetClient;
-    private final String reader;
-    private final Resource oplogTrackerResource;
-    private final HashMap<String, Boolean> allowedNamespaces;
+	private final HashMap<String, Boolean> allowedNamespaces = new HashMap<>();
 
-    final static Logger logger = LoggerFactory.getLogger(OplogWriter.class);
-    private final DatabaseFilterPredicate databasePredicate;
-    private final CollectionFilterPredicate collectionPredicate;
+	private final MongoClient targetClient;
+	private MongoClient sourceClient;
 
-    public OplogWriter(MongoClient targetClient, MongoClient oplogStoreClient, String reader, ApplicationOptions options) {
-        this.targetClient = targetClient;
-        this.oplogStoreClient = oplogStoreClient;
-        this.reader = reader;
-        oplogTrackerResource = new Resource("migrate-mongo", "oplog.tracker");
-        allowedNamespaces = new HashMap<>();
+	private final static Logger logger = LoggerFactory.getLogger(OplogWriter.class);
+	private final DatabaseFilterPredicate databasePredicate;
+	private final CollectionFilterPredicate collectionPredicate;
 
-        List<ResourceFilter> blacklistFilter = options.getBlackListFilter();
-        databasePredicate = new DatabaseFilterPredicate(blacklistFilter);
-        collectionPredicate = new CollectionFilterPredicate(blacklistFilter);
-    }
+	private final int BATCH_SIZE = 1000;
 
-    /**
-     * Applies the oplog documents on the oplog store
-     *
-     * @param operations a list of oplog operation documents
-     * @throws AppException
-     */
-    public int applyOperations(List<Document> operations) throws AppException {
-        int totalModelsAdded = 0;
-        int totalValidOperations = 0;
-        String previousNamespace = null;
-        Document previousDocument = null;
-        List<WriteModel<Document>> models = new ArrayList<>();
+	private LocalDateTime last = LocalDateTime.now();
 
-        for(int i = 0; i < operations.size(); i++) {
-            Document currentDocument = operations.get(i);
-            String currentNamespace = currentDocument.getString("ns");
+	public OplogWriter(ApplicationOptions options) {
+		targetClient = options.getTargetClient();
+		sourceClient = options.getSourceClient();
 
-            if (!isNamespaceAllowed(currentNamespace)) {
-                continue;
-            }
-            if (!currentNamespace.equals(previousNamespace)) {
-                // change of namespace. bulk apply models for previous namespace
-                if (previousNamespace != null && models.size() > 0) {
-                    BulkWriteResult bulkWriteResult = applyBulkWriteModelsOnCollection(previousNamespace, models);
-                    if (bulkWriteResult != null) {
-                        totalModelsAdded += bulkWriteResult.getDeletedCount() + bulkWriteResult.getModifiedCount() + bulkWriteResult.getInsertedCount();
-                    }
-                    models.clear();
-                    // save documents timestamp to oplog tracker
-                    saveTimestampToOplogStore(previousDocument);
-                }
-                previousNamespace = currentNamespace;
-                previousDocument = currentDocument;
-            }
-            WriteModel<Document> model = getWriteModelForOperation(currentDocument);
-            if (model != null) {
-                models.add(model);
-                totalValidOperations++;
-            }
-            else {
-                // if the command is $cmd for create index or create collection, there would not be any write model.
-                logger.info(String.format("could not convert the document to model. Give document is [%s]", currentDocument.toJson()));
-            }
-        }
+		databasePredicate = new DatabaseFilterPredicate(options.getBlackListFilter());
+		collectionPredicate = new CollectionFilterPredicate(options.getBlackListFilter());
+	}
 
-        if (models.size() > 0) {
-            BulkWriteResult bulkWriteResult = applyBulkWriteModelsOnCollection(previousNamespace, models);
-            if (bulkWriteResult != null) {
-                totalModelsAdded += bulkWriteResult.getDeletedCount() + bulkWriteResult.getModifiedCount() + bulkWriteResult.getInsertedCount();
+	/**
+	 * Applies the oplog documents on the oplog store
+	 *
+	 * @param operations
+	 *          a list of oplog operation documents
+	 */
+	public void applyOperations(ConcurrentLinkedQueue<Document> queue) {
+		Map<String, List<WriteModel<Document>>> namespaceModels = new HashMap<String, List<WriteModel<Document>>>();
 
-                // save documents timestamp to oplog tracker
-                saveTimestampToOplogStore(previousDocument);
-            }
-        }
+		while (true) {
+			Document doc = queue.poll();
 
-        if (totalModelsAdded != totalValidOperations) {
-            logger.warn("total models added {} is not equal to operations injected {}", totalModelsAdded, operations.size());
-        }
+			while (doc == null) {
+				logger.info(String.format("queue empty"));
 
-        return totalModelsAdded;
-    }
+				namespaceModels.forEach((ns, models) -> {
+					if (models.size() > 0) {
+						applyBulkWriteModelsOnCollection(ns, models);
+						logger.info("draining buffer {} for {} docs", ns, models.size());
+						models.clear();
+					}
+				});
 
-    private boolean isNamespaceAllowed(String namespace) {
-        if (!allowedNamespaces.containsKey(namespace))
-        {
-            boolean allow = checkIfNamespaceIsAllowed(namespace);
-            allowedNamespaces.put(namespace, allow);
-        }
-        // return cached value
-        return allowedNamespaces.get(namespace);
-    }
+				try {
+					Thread.sleep(1000);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+				doc = queue.poll();
+			}
 
-    private boolean checkIfNamespaceIsAllowed(String namespace) {
-        String databaseName = namespace.split("\\.")[0];
-        try {
-            Document dbDocument = new Document("name", databaseName);
-            boolean isNotBlacklistedDB = databasePredicate.test(dbDocument);
-            if (isNotBlacklistedDB) {
-                // check for collection as well
-                String collectionName = namespace.substring(databaseName.length()+1);
-                Resource resource = new Resource(databaseName, collectionName);
-                return collectionPredicate.test(resource);
-            }
-            else {
-                return false;
-            }
-        } catch (Exception e) {
-            logger.error("error while testing the namespace is in black list or not");
-            return false;
-        }
-    }
+			logGapStats(doc);
 
-    private BulkWriteResult applyBulkWriteModelsOnCollection(String namespace,
-                                 List<WriteModel<Document>> operations)  throws AppException {
-        MongoCollection<Document> collection = MongoDBHelper.getCollectionByNamespace(this.targetClient, namespace);
-        try{
-            return applyBulkWriteModelsOnCollection(collection, operations);
-        }
-        catch (MongoBulkWriteException err) {
-            if (err.getWriteErrors().size() == operations.size()) {
-                // every doc in this batch is error. just move on
-                return null;
-            }
-            logger.warn("bulk write of oplog entries failed. applying oplog operations one by one");
-            BulkWriteResult bulkWriteResult = null;
-            for (WriteModel<Document> op : operations) {
-                List<WriteModel<Document>> soloBulkOp = new ArrayList<>();
-                soloBulkOp.add(op);
-                try {
-                    bulkWriteResult = applyBulkWriteModelsOnCollection(collection, soloBulkOp);
-                } catch (Exception soloErr) {
-                    // do nothing
-                }
-            }
-            return bulkWriteResult;
-        }
-        catch (Exception ex) {
-            logger.warn("bulk write of oplog entries failed. doing one by one now");
-        }
-        return null;
-    }
+			String ns = doc.getString("ns");
+			if (!isNamespaceAllowed(ns)) {
+				continue;
+			}
 
-    private BulkWriteResult applyBulkWriteModelsOnCollection(MongoCollection<Document> collection, List<WriteModel<Document>> operations) throws AppException {
-        BulkWriteResult writeResult = MongoDBHelper.performOperationWithRetry(
-                () -> {
-                    BulkWriteOptions options = new BulkWriteOptions();
-                    options.ordered(true);
-                    return collection.bulkWrite(operations, options);
-                }
-                , new Document("operation", "bulkWrite"));
-        return writeResult;
-    }
+			List<WriteModel<Document>> models = namespaceModels.get(ns);
+			if (models == null) {
+				models = new ArrayList<WriteModel<Document>>(BATCH_SIZE);
+				namespaceModels.put(ns, models);
+			}
 
-    /**
-     * Get's a WriteModel for the given oplog operation
-     *
-     * @param operation an oplog operation
-     * @return a WriteModel of a bulk operation
-     */
-    private WriteModel<Document> getWriteModelForOperation(Document operation)  throws AppException {
-        String message;
-        WriteModel<Document> model = null;
-        switch (operation.getString("op")){
-            case "i":
-                model = getInsertWriteModel(operation);
-                break;
-            case "u":
-                model = getUpdateWriteModel(operation);
-                break;
-            case "d":
-                model = getDeleteWriteModel(operation);
-                break;
-            case "c":
-                // might have to be individual operation
-                performRunCommand(operation);
-                //TODO performRunCommand
-                // update the last timestamp on oplogStore
-                break;
-            case "n":
-                break;
-            default:
-                message = String.format("unsupported operation %s; op: %s", operation.getString("op"), operation.toJson());
-                logger.error(message);
-                throw new AppException(message);
-        }
-        return model;
-    }
+			WriteModel<Document> model = getWriteModelForOperation(doc);
+			if (model != null) {
+				models.add(model);
+			}
 
-    private WriteModel<Document> getInsertWriteModel(Document operation) {
-        Document document = operation.get("o", Document.class);
-        return new InsertOneModel<>(document);
-    }
+			if (models.size() == BATCH_SIZE) {
+				applyBulkWriteModelsOnCollection(ns, models);
+				models.clear();
+			}
 
-    private WriteModel<Document>  getUpdateWriteModel(Document operation) throws AppException {
-        Document find = operation.get("o2", Document.class);
-        Document update = operation.get("o", Document.class);
+		}
+	}
 
-        return new UpdateOneModel<>(find, update);
-    }
+	private Document getLatestOplogEntryFromSource() {
+		MongoCollection<Document> collection = sourceClient.getDatabase("local").getCollection("oplog.rs");
+		return collection.find().sort(Sorts.descending("$natural")).limit(1).first();
+	}
 
-    private WriteModel<Document>  getDeleteWriteModel(Document operation) throws AppException {
-        Document find = operation.get("o", Document.class);
-        return new DeleteOneModel<>(find);
-    }
+	private boolean isNamespaceAllowed(String namespace) {
+		if (!allowedNamespaces.containsKey(namespace)) {
+			boolean allow = checkIfNamespaceIsAllowed(namespace);
+			allowedNamespaces.put(namespace, allow);
+		}
+		// return cached value
+		return allowedNamespaces.get(namespace);
+	}
 
-    private void performRunCommand(Document operation) throws AppException {
-        Document document = operation.get("o", Document.class);
-        String databaseName = operation.getString("ns").replace(".$cmd", "");
+	private boolean checkIfNamespaceIsAllowed(String namespace) {
+		String databaseName = namespace.split("\\.")[0];
+		try {
+			Document dbDocument = new Document("name", databaseName);
+			boolean isNotBlacklistedDB = databasePredicate.test(dbDocument);
+			if (isNotBlacklistedDB) {
+				// check for collection as well
+				String collectionName = namespace.substring(databaseName.length() + 1);
+				Resource resource = new Resource(databaseName, collectionName);
+				return collectionPredicate.test(resource);
+			} else {
+				return false;
+			}
+		} catch (Exception e) {
+			logger.error("error while testing the namespace is in black list or not");
+			return false;
+		}
+	}
 
-        MongoDatabase database = MongoDBHelper.getDatabase(this.targetClient, databaseName);
-        MongoDBHelper.performOperationWithRetry(() -> {
-            database.runCommand(document);
-            return 1L;
-        }, operation);
+	private BulkWriteResult applyBulkWriteModelsOnCollection(String namespace, List<WriteModel<Document>> operations) {
 
-        String message = String.format("completed runCommand op on database: %s; document: %s", databaseName, operation.toJson());
-        logger.debug(message);
-    }
+		MongoCollection<Document> collection = getCollectionByNamespace(this.targetClient, namespace);
+		try {
+			List<WriteModel<Document>> bulkOp = new ArrayList<WriteModel<Document>>();
+			for (WriteModel<Document> op : operations) {
+				bulkOp.add(op);
+			}
 
-    /**
-     * Save's a document as the lastest oplog timestamp on oplog store
-     *
-     * @param document a document representing the fields that need to be set
-     */
-    protected void saveTimestampToOplogStore(Document document) {
-        WritableDataTracker tracker = new OplogTimestampTracker(oplogStoreClient, oplogTrackerResource, this.reader);
-        tracker.updateLatestDocument(document);
-    }
+			BulkWriteOptions options = new BulkWriteOptions();
+			options.ordered(true);
+
+			return collection.bulkWrite(bulkOp, options);
+
+		} catch (MongoBulkWriteException err) {
+
+			for (WriteModel<Document> op : operations) {
+				try {
+					List<WriteModel<Document>> bulkOp = new ArrayList<WriteModel<Document>>();
+					bulkOp.add(op);
+					collection.bulkWrite(bulkOp);
+				} catch (MongoBulkWriteException err2) {
+					for (BulkWriteError bulkWriteError : err2.getWriteErrors()) {
+						if (bulkWriteError.getCode() != 11000) {
+							logger.warn(bulkWriteError.getMessage() + " " + bulkWriteError.getDetails());
+						}
+					}
+				}
+			}
+
+		} catch (Exception e) {
+			logger.error("Unplanned", e);
+		}
+		return null;
+	}
+
+	private void logGapStats(Document lastOplogProcessed) {
+		LocalDateTime now = LocalDateTime.now();
+
+		Duration diff = Duration.between(last, now);
+		if (diff.getSeconds() > 5) {
+
+			Document latestOplogEntryFromSource = getLatestOplogEntryFromSource();
+
+			BsonTimestamp sourceOpTime = latestOplogEntryFromSource.get("ts", BsonTimestamp.class);
+			BsonTimestamp targetOpTime = lastOplogProcessed.get("ts", BsonTimestamp.class);
+
+			int gapInSeconds = sourceOpTime.getTime() - targetOpTime.getTime();
+
+			long s = sourceOpTime.getTime();
+			Date sd = new Date(s * 1000);
+			long t = targetOpTime.getTime();
+			Date td = new Date(t * 1000);
+
+			TimeZone tz = TimeZone.getTimeZone("America/Montreal");
+			DateFormat df = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX");
+			df.setTimeZone(tz);
+
+			String message = String.format("Target is behind by %d seconds\nSource: %s\nTarget: %s", gapInSeconds, df.format(sd), df.format(td));
+			logger.info(message);
+
+			last = now;
+		}
+
+	}
+
+	/**
+	 * Get's a WriteModel for the given oplog operation
+	 *
+	 * @param operation
+	 *          an oplog operation
+	 * @return a WriteModel of a bulk operation
+	 */
+	private WriteModel<Document> getWriteModelForOperation(Document operation) {
+		String message;
+		WriteModel<Document> model = null;
+		switch (operation.getString("op")) {
+		case "i":
+			model = getInsertWriteModel(operation);
+			break;
+		case "u":
+			model = getUpdateWriteModel(operation);
+			break;
+		case "d":
+			model = getDeleteWriteModel(operation);
+			break;
+		case "c":
+			// might have to be individual operation
+			performRunCommand(operation);
+			break;
+		case "n":
+			break;
+		default:
+			message = String.format("unsupported operation %s; op: %s", operation.getString("op"), operation.toJson());
+			logger.error(message);
+			throw new RuntimeException(message);
+		}
+		return model;
+	}
+
+	private WriteModel<Document> getInsertWriteModel(Document operation) {
+		Document document = operation.get("o", Document.class);
+		return new InsertOneModel<>(document);
+	}
+
+	private WriteModel<Document> getUpdateWriteModel(Document operation) {
+		Document find = operation.get("o2", Document.class);
+		Document update = operation.get("o", Document.class);
+		update.remove("$v");
+
+		if (!update.containsKey("$set")) {
+			Document doc = new Document();
+			doc.append("$set", update);
+			update = doc;
+		}
+
+		return new UpdateOneModel<>(find, update);
+	}
+
+	private WriteModel<Document> getDeleteWriteModel(Document operation) {
+		Document find = operation.get("o", Document.class);
+		return new DeleteOneModel<>(find);
+	}
+
+	private void performRunCommand(Document operation) {
+		Document document = operation.get("o", Document.class);
+		String databaseName = operation.getString("ns").replace(".$cmd", "");
+		this.targetClient.getDatabase(databaseName).runCommand(document);
+
+		String message = String.format("completed runCommand op on database: %s; document: %s", databaseName, operation.toJson());
+		logger.debug(message);
+	}
+
+	private MongoCollection<Document> getCollectionByNamespace(MongoClient client, String ns) {
+		String[] parts = ns.split("\\.");
+		String databaseName = parts[0];
+		String collectionName = ns.substring(databaseName.length() + 1);
+
+		return client.getDatabase(databaseName).getCollection(collectionName);
+	}
+
 }

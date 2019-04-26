@@ -1,107 +1,112 @@
 package com.mongodb.migratecluster.commandline;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
-import com.mongodb.migratecluster.utils.ListUtils;
-
 import java.util.ArrayList;
 import java.util.List;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.mongodb.MongoClient;
+import com.mongodb.MongoClientURI;
+
 /**
- * File: ApplicationOptions
- * Author: shyam.arjarapu
- * Date: 4/13/17 11:47 PM
- * Description:
+ * File: ApplicationOptions Author: shyam.arjarapu Date: 4/13/17 11:47 PM Description:
  */
 public class ApplicationOptions {
-    private String sourceCluster;
-    private String targetCluster;
-    private String oplogStore;
-    private String configFilePath;
-    private boolean showHelp;
-    private boolean dropTarget;
-    private List<ResourceFilter> blackListFilter;
+	private String sourceCluster;
+	private String targetCluster;
+	private String configFilePath;
+	private boolean showHelp;
+	private List<ResourceFilter> blackListFilter;
 
-    public ApplicationOptions() {
-        sourceCluster = "";
-        targetCluster = "";
-        oplogStore = "";
-        configFilePath = "";
-        showHelp = false;
-        dropTarget = false;
-        setBlackListFilter(new ArrayList<>());
-    }
+	private MongoClient sourceClient;
+	private MongoClient targetClient;
 
+	public ApplicationOptions() {
+		sourceCluster = "";
+		targetCluster = "";
+		configFilePath = "";
+		showHelp = false;
+		setBlackListFilter(new ArrayList<>());
+	}
 
-    @JsonProperty("sourceCluster")
-    public String getSourceCluster() {
-        return sourceCluster;
-    }
+	@JsonProperty("sourceCluster")
+	public String getSourceCluster() {
+		return sourceCluster;
+	}
 
-    public void setSourceCluster(String sourceCluster) {
-        this.sourceCluster = sourceCluster;
-    }
+	public void setSourceCluster(String sourceCluster) {
+		this.sourceCluster = sourceCluster;
+	}
 
-    @JsonProperty("targetCluster")
-    public String getTargetCluster() {
-        return targetCluster;
-    }
+	@JsonProperty("targetCluster")
+	public String getTargetCluster() {
+		return targetCluster;
+	}
 
-    public void setTargetCluster(String targetCluster) {
-        this.targetCluster = targetCluster;
-    }
+	public void setTargetCluster(String targetCluster) {
+		this.targetCluster = targetCluster;
+	}
 
-    @JsonProperty("oplogStore")
-    public String getOplogStore() {
-        return oplogStore;
-    }
+	@JsonProperty("configFilePath")
+	public String getConfigFilePath() {
+		return configFilePath;
+	}
 
-    public void setOplogStore(String oplogStore) {
-        this.oplogStore = oplogStore;
-    }
+	public void setConfigFilePath(String configFilePath) {
+		this.configFilePath = configFilePath;
+	}
 
-    @JsonProperty("configFilePath")
-    public String getConfigFilePath() {
-        return configFilePath;
-    }
+	public boolean isShowHelp() {
+		return showHelp;
+	}
 
-    public void setConfigFilePath(String configFilePath) {
-        this.configFilePath = configFilePath;
-    }
+	public void setShowHelp(boolean showHelp) {
+		this.showHelp = showHelp;
+	}
 
-    public boolean isShowHelp() {
-        return showHelp;
-    }
+	@JsonProperty("blackListFilter")
+	public List<ResourceFilter> getBlackListFilter() {
+		return blackListFilter;
+	}
 
-    public void setShowHelp(boolean showHelp) {
-        this.showHelp = showHelp;
-    }
+	public void setBlackListFilter(List<ResourceFilter> blackListFilter) {
+		this.blackListFilter = blackListFilter;
+	}
 
-    @JsonProperty("dropTarget")
-    public boolean isDropTarget() {
-        return dropTarget;
-    }
+	/**
+	 * Get's the Mongo Client pointing to the custom cluster
+	 *
+	 * @param cluster
+	 *          a string representing a mongodb servers
+	 * @return a MongoClient object pointing to specific cluster
+	 */
+	private MongoClient getMongoClient(String cluster) {
+		String connectionString = String.format("mongodb://%s", cluster);
+		MongoClientURI uri = new MongoClientURI(connectionString);
+		return new MongoClient(uri);
+	}
 
-    public void setDropTarget(boolean dropTarget) {
-        this.dropTarget = dropTarget;
-    }
+	/**
+	 * Get's the Mongo Client pointing to the source cluster
+	 *
+	 * @return a MongoClient object pointing to source
+	 */
+	public MongoClient getSourceClient() {
+		if (sourceClient == null) {
+			sourceClient = getMongoClient(getSourceCluster());
+		}
+		return sourceClient;
+	}
 
-    @JsonProperty("blackListFilter")
-    public List<ResourceFilter> getBlackListFilter() {
-        return blackListFilter;
-    }
-
-    public void setBlackListFilter(List<ResourceFilter> blackListFilter) {
-        this.blackListFilter = blackListFilter;
-    }
-
-    @Override
-    public String toString() {
-        return String.format("{ showHelp : %s, configFilePath: \"%s\", " +
-                " sourceCluster: \"%s\", targetCluster: \"%s\", " +
-                ", oplog: \"%s\", drop: %s, blackListFilter: %s }",
-                this.isShowHelp(), this.getConfigFilePath(), this.getSourceCluster(),
-                this.getTargetCluster(), this.getOplogStore(), this.isDropTarget(),
-                ListUtils.select(this.getBlackListFilter(), f -> f.toString()));
-    }
+	/**
+	 * Get's the Mongo Client pointing to the target cluster
+	 *
+	 * @return a MongoClient object pointing to target
+	 */
+	public MongoClient getTargetClient() {
+		if (targetClient == null) {
+			targetClient = getMongoClient(getTargetCluster());
+		}
+		return targetClient;
+	}
 
 }
